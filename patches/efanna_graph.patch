@@ -1,0 +1,218 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 2.8)
++cmake_minimum_required(VERSION 3.10)
+ 
+ project(efanna2e)
+ include_directories(${PROJECT_SOURCE_DIR}/include)
+--- a/include/efanna2e/index_pq.h
++++ /dev/null
+@@ -1,47 +0,0 @@
+-//
+-// Created by 付聪 on 2017/6/26.
+-//
+-
+-#ifndef EFANNA2E_INDEX_PQ_H
+-#define EFANNA2E_INDEX_PQ_H
+-#include <faiss/AutoTune.h>
+-#include "util.h"
+-#include "parameters.h"
+-#include "neighbor.h"
+-#include "index.h"
+-#include <cassert>
+-
+-namespace efanna2e {
+-class IndexPQ : public Index {
+- public:
+-  explicit IndexPQ(const size_t dimension, const size_t n, Metric m, Index *initializer);
+-
+-
+-  virtual ~IndexPQ();
+-
+-  virtual void Save(const char *filename)override;
+-  virtual void Load(const char *filename)override;
+-
+-
+-  virtual void Build(size_t n, const float *data, const Parameters &parameters) override;
+-
+-  virtual void Search(
+-      const float *query,
+-      const float *x,
+-      size_t k,
+-      const Parameters &parameters,
+-      unsigned *indices) override;
+-
+- protected:
+-
+-  Index *initializer_;
+-  faiss::Index* index;
+-  void compute_gt_for_tune(const float* q,
+-                           const unsigned nq,
+-                          const unsigned k,
+-                           unsigned *gt);
+-};
+-}
+-
+-
+-#endif //EFANNA2E_INDEX_PQ_H
+--- a/include/efanna2e/neighbor.h
++++ b/include/efanna2e/neighbor.h
+@@ -51,6 +51,25 @@
+     std::copy(other.nn_new.begin(), other.nn_new.end(), std::back_inserter(nn_new));
+     nn_new.reserve(other.nn_new.capacity());
+     pool.reserve(other.pool.capacity());
++  }
++
++   
++  nhood(nhood &&other) noexcept
++      : lock(), M(other.M), pool(std::move(other.pool)),
++        nn_old(std::move(other.nn_old)), nn_new(std::move(other.nn_new)),
++        rnn_old(std::move(other.rnn_old)), rnn_new(std::move(other.rnn_new)) {}
++
++   
++  nhood& operator=(nhood &&other) noexcept {
++    if (this != &other) {
++      M = other.M;
++      pool = std::move(other.pool);
++      nn_old = std::move(other.nn_old);
++      nn_new = std::move(other.nn_new);
++      rnn_old = std::move(other.rnn_old);
++      rnn_new = std::move(other.rnn_new);
++    }
++    return *this;
+   }
+   void insert (unsigned id, float dist) {
+     LockGuard guard(lock);
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -5,4 +5,4 @@
+ add_library(${PROJECT_NAME} ${CPP_SOURCES})
+ add_library(${PROJECT_NAME}_s STATIC ${CPP_SOURCES})
+ 
+-#install()
+\ No newline at end of file
++#install()
+--- a/src/index_pq.cpp
++++ /dev/null
+@@ -1,110 +0,0 @@
+-//
+-// Created by 付聪 on 2017/6/26.
+-//
+-#include <efanna2e/index_pq.h>
+-#include <efanna2e/exceptions.h>
+-#include <efanna2e/parameters.h>
+-#include <faiss/index_io.h>
+-#include <omp.h>
+-
+-namespace efanna2e {
+-IndexPQ::IndexPQ(const size_t dimension, const size_t n, Metric m, Index *initializer):Index(dimension, n, m),
+-     initializer_{initializer}{}
+-
+-
+-IndexPQ::~IndexPQ(){}
+-
+-void IndexPQ::Save(const char *filename){
+-  faiss::write_index(index, filename);
+-}
+-void IndexPQ::Load(const char *filename){
+-  index = faiss::read_index(filename);
+-}
+-
+-void IndexPQ::compute_gt_for_tune(const float* q,
+-                         const unsigned nq,
+-                        const unsigned k,
+-                         unsigned *gt){
+-#pragma omp parallel for
+-  for(unsigned i=0; i<nq; i++){
+-    std::vector<Neighbor> res;
+-    for(unsigned j=0; j<nd_; j++){
+-      float dist = distance_->compare(q + i * dimension_, data_ + j * dimension_, dimension_);
+-      res.push_back(Neighbor(j, dist, true));
+-    }
+-    std::partial_sort(res.begin(), res.begin()+k, res.end());
+-    for(unsigned j=0; j<k; j++){
+-      gt[i * k + j] = res[j].id;
+-    }
+-  }
+-
+-}
+-
+-void IndexPQ::Build(size_t n, const float *data, const Parameters &parameters) {
+-  const std::string pq_index_key = parameters.Get<std::string>("pq_index_key");
+-  data_ = data;
+-  index = faiss::index_factory(dimension_, pq_index_key.c_str());
+-  index->train(nd_, data_);
+-  index->add(nd_, data_);
+-
+-  unsigned sample_num = 100;
+-  float* sample_queries = new float[dimension_ * sample_num];
+-  std::vector<unsigned> tmp(sample_num);
+-  std::mt19937 rng;
+-  GenRandom(rng, tmp.data(), sample_num, nd_);
+-
+-  for(unsigned i=0; i<tmp.size(); i++){
+-    unsigned id = tmp[i];
+-    memcpy(sample_queries + i * dimension_, data_ + id * dimension_, dimension_ * sizeof(float));
+-  }
+-
+-  unsigned k = 10;
+-  faiss::Index::idx_t *gt = new faiss::Index::idx_t[k * sample_num];//ground truth
+-  unsigned * gt_c = new unsigned[k * sample_num];
+-  compute_gt_for_tune(sample_queries, sample_num, k, gt_c);
+-  for(unsigned i=0; i<k*sample_num; i++){
+-    gt[i] = gt_c[i];
+-  }
+-  delete [] gt_c;
+-  std::string selected_params;
+-
+-  faiss::IntersectionCriterion crit(sample_num, k);
+-  crit.set_groundtruth (k, nullptr, gt);
+-  crit.nnn = k; // by default, the criterion will request only 1 NN
+-
+-  std::cout<<"Preparing auto-tune parameters\n";
+-
+-  faiss::ParameterSpace params;
+-  params.initialize(index);
+-  faiss::OperatingPoints ops;
+-  params.explore (index, sample_num, sample_queries, crit, &ops);
+-  for (size_t i = 0; i < ops.optimal_pts.size(); i++) {
+-    if (ops.optimal_pts[i].perf > 0.5) {
+-      selected_params = ops.optimal_pts[i].key;
+-      break;
+-    }
+-  }
+-
+-  std::cout<<"best parameters auto-tuned: "<<selected_params<<std::endl;
+-  has_built = true;
+-}
+-
+-void IndexPQ::Search(
+-    const float *query,
+-    const float *x,
+-    size_t k,
+-    const Parameters &parameters,
+-    unsigned *indices) {
+-  std::string search_key = parameters.Get<std::string>("pq_search_key");
+-  faiss::ParameterSpace f_params;
+-  f_params.set_index_parameters(index, search_key.c_str());
+-
+-  faiss::Index::idx_t *Ids = new faiss::Index::idx_t[k];
+-  float *Dists = new float[k];
+-
+-  index->search(1, query, k, Dists, Ids);
+-  for(unsigned i=0; i<k; i++){
+-    indices[i] = Ids[i];
+-  }
+-}
+-}
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -9,5 +9,5 @@
+ add_executable(test_kdtree_graph test_kdtree_graph.cpp)
+ target_link_libraries(test_kdtree_graph ${PROJECT_NAME})
+ 
+-add_executable(test_faiss_graph test_faiss_graph.cpp)
+-target_link_libraries(test_faiss_graph ${PROJECT_NAME} faiss ${BLAS_LIB})
++
++

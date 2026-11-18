@@ -1,0 +1,487 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 2.8)
++cmake_minimum_required(VERSION 3.5)
+ 
+ project(efanna2e)
+ include_directories(${PROJECT_SOURCE_DIR}/include)
+--- a/include/efanna2e/index_nsg.h
++++ b/include/efanna2e/index_nsg.h
+@@ -16,6 +16,9 @@
+ 
+ class IndexNSG : public Index {
+  public:
++   
++  typedef std::vector<std::vector<unsigned > > CompactGraph;
++
+   explicit IndexNSG(const size_t dimension, const size_t n, Metric m, Index *initializer);
+ 
+ 
+@@ -38,10 +41,27 @@
+       size_t K,
+       const Parameters &parameters,
+       unsigned *indices);
++
++   
++  void SearchWithOptGraph(
++      const float *query,
++      size_t K,
++      const Parameters &parameters,
++      const std::vector<std::pair<unsigned, float>>& entry_points,
++      unsigned *indices);
++
++   
++  static unsigned long long distance_computation_counter;
++   
++  static unsigned long long early_termination_counter;
+   void OptimizeGraph(float* data);
+ 
++   
++  unsigned GetEntryPoint() const { return ep_; }
++  void SetEntryPoint(unsigned ep) { ep_ = ep; }
++  const CompactGraph& GetGraph() const { return final_graph_; }
++
+   protected:
+-    typedef std::vector<std::vector<unsigned > > CompactGraph;
+     typedef std::vector<SimpleNeighbors > LockGraph;
+     typedef std::vector<nhood> KNNGraph;
+ 
+--- a/include/efanna2e/parameters.h
++++ b/include/efanna2e/parameters.h
+@@ -32,10 +32,10 @@
+   }
+ 
+   template<typename ParamType>
+-  inline ParamType Get(const std::string &name, const ParamType &default_value) {
++  inline ParamType Get(const std::string &name, const ParamType &default_value) const {
+     try {
+       return Get<ParamType>(name);
+-    } catch (std::invalid_argument e) {
++    } catch (const std::invalid_argument& e) {
+       return default_value;
+     }
+   }
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -1,8 +1,27 @@
+ set(CMAKE_CXX_STANDARD 11)
+ 
+-file(GLOB_RECURSE CPP_SOURCES *.cpp)
+ 
+-add_library(${PROJECT_NAME} ${CPP_SOURCES})
+-add_library(${PROJECT_NAME}_s STATIC ${CPP_SOURCES})
++set(COMMON_SOURCES
++    index.cpp
++)
+ 
+-#install()
+\ No newline at end of file
++set(SOURCES_NO_EARLY_TERM
++    ${COMMON_SOURCES}
++    index_nsg.cpp
++)
++
++
++
++
++
++
++
++
++add_library(${PROJECT_NAME} ${SOURCES_NO_EARLY_TERM})
++add_library(${PROJECT_NAME}_s STATIC ${SOURCES_NO_EARLY_TERM})
++
++
++
++
++
++#install()
+--- a/src/index_nsg.cpp
++++ b/src/index_nsg.cpp
+@@ -4,6 +4,7 @@
+ #include <bitset>
+ #include <chrono>
+ #include <cmath>
++#include <iostream>
+ #include <boost/dynamic_bitset.hpp>
+ 
+ #include "efanna2e/exceptions.h"
+@@ -11,6 +12,10 @@
+ 
+ namespace efanna2e {
+ #define _CONTROL_NUM 100
++
++ 
++unsigned long long IndexNSG::distance_computation_counter = 0;
++
+ IndexNSG::IndexNSG(const size_t dimension, const size_t n, Metric m,
+                    Index *initializer)
+     : Index(dimension, n, m), initializer_{initializer} {}
+@@ -236,7 +241,7 @@
+   ep_ = rand() % nd_;  // random initialize navigating point
+   get_neighbors(center, parameters, tmp, pool);
+   ep_ = tmp[0].id;
+-  delete center;
++  delete[] center;
+ }
+ 
+ void IndexNSG::sync_prune(unsigned q, std::vector<Neighbor> &pool,
+@@ -436,7 +441,7 @@
+   printf("Degree Statistics: Max = %d, Min = %d, Avg = %d\n", max, min, avg);
+ 
+   has_built = true;
+-  delete cut_graph_;
++  delete[] cut_graph_;
+ }
+ 
+ void IndexNSG::Search(const float *query, const float *x, size_t K,
+@@ -506,22 +511,34 @@
+ void IndexNSG::SearchWithOptGraph(const float *query, size_t K,
+                                   const Parameters &parameters, unsigned *indices) {
+   unsigned L = parameters.Get<unsigned>("L_search");
++  if (L < K) {
++    L = (unsigned)K;
++  }
++
++  unsigned long long local_dist_cnt = 0;
+   DistanceFastL2 *dist_fast = (DistanceFastL2 *)distance_;
+ 
+   std::vector<Neighbor> retset(L + 1);
+   std::vector<unsigned> init_ids(L);
+-  // std::mt19937 rng(rand());
+-  // GenRandom(rng, init_ids.data(), L, (unsigned) nd_);
+-
+   boost::dynamic_bitset<> flags{nd_, 0};
++
++   
+   unsigned tmp_l = 0;
+-  unsigned *neighbors = (unsigned *)(opt_graph_ + node_size * ep_ + data_len);
+-  unsigned MaxM_ep = *neighbors;
+-  neighbors++;
+-
+-  for (; tmp_l < L && tmp_l < MaxM_ep; tmp_l++) {
+-    init_ids[tmp_l] = neighbors[tmp_l];
+-    flags[init_ids[tmp_l]] = true;
++  init_ids[tmp_l] = ep_;
++  flags[ep_] = true;
++  tmp_l++;
++
++  unsigned *ep_neighbors = (unsigned *)(opt_graph_ + node_size * ep_ + data_len);
++  unsigned MaxM_ep = *ep_neighbors;
++  ep_neighbors++;
++
++  for (unsigned i = 0; i < MaxM_ep && tmp_l < L; i++) {
++    unsigned neighbor_id = ep_neighbors[i];
++    if (neighbor_id < nd_ && !flags[neighbor_id]) {
++      init_ids[tmp_l] = neighbor_id;
++      flags[neighbor_id] = true;
++      tmp_l++;
++    }
+   }
+ 
+   while (tmp_l < L) {
+@@ -532,26 +549,26 @@
+     tmp_l++;
+   }
+ 
+-  for (unsigned i = 0; i < init_ids.size(); i++) {
++   
++  for (unsigned i = 0; i < tmp_l; i++) {
++    _mm_prefetch(opt_graph_ + node_size * init_ids[i], _MM_HINT_T0);
++  }
++
++  L = 0;
++  for (unsigned i = 0; i < tmp_l; i++) {
+     unsigned id = init_ids[i];
+-    if (id >= nd_) continue;
+-    _mm_prefetch(opt_graph_ + node_size * id, _MM_HINT_T0);
+-  }
+-  L = 0;
+-  for (unsigned i = 0; i < init_ids.size(); i++) {
+-    unsigned id = init_ids[i];
+-    if (id >= nd_) continue;
+     float *x = (float *)(opt_graph_ + node_size * id);
+     float norm_x = *x;
+     x++;
+     float dist = dist_fast->compare(x, query, norm_x, (unsigned)dimension_);
+-    retset[i] = Neighbor(id, dist, true);
+-    flags[id] = true;
++    local_dist_cnt++;
++    retset[L] = Neighbor(id, dist, true);
+     L++;
+   }
+-  // std::cout<<L<<std::endl;
+ 
+   std::sort(retset.begin(), retset.begin() + L);
++
++   
+   int k = 0;
+   while (k < (int)L) {
+     int nk = L;
+@@ -560,36 +577,182 @@
+       retset[k].flag = false;
+       unsigned n = retset[k].id;
+ 
+-      _mm_prefetch(opt_graph_ + node_size * n + data_len, _MM_HINT_T0);
+-      unsigned *neighbors = (unsigned *)(opt_graph_ + node_size * n + data_len);
++       
++      if (k + 1 < (int)L && retset[k + 1].flag) {
++        unsigned next_id = retset[k + 1].id;
++        _mm_prefetch(opt_graph_ + node_size * next_id, _MM_HINT_T0);
++        _mm_prefetch(opt_graph_ + node_size * next_id + data_len, _MM_HINT_T0);
++      }
++
++       
++      char* neighbor_base = opt_graph_ + node_size * n + data_len;
++      unsigned *neighbors = (unsigned *)neighbor_base;
+       unsigned MaxM = *neighbors;
+       neighbors++;
+-      for (unsigned m = 0; m < MaxM; ++m)
+-        _mm_prefetch(opt_graph_ + node_size * neighbors[m], _MM_HINT_T0);
++
++       
++      constexpr unsigned PREFETCH_DISTANCE = 3;
++
+       for (unsigned m = 0; m < MaxM; ++m) {
++        if (m + PREFETCH_DISTANCE < MaxM) {
++          unsigned p_id = neighbors[m + PREFETCH_DISTANCE];
++          _mm_prefetch(opt_graph_ + node_size * p_id, _MM_HINT_T1);
++        }
++
+         unsigned id = neighbors[m];
+         if (flags[id]) continue;
+         flags[id] = 1;
++
+         float *data = (float *)(opt_graph_ + node_size * id);
+         float norm = *data;
+         data++;
++
+         float dist = dist_fast->compare(query, data, norm, (unsigned)dimension_);
++        local_dist_cnt++;
++
+         if (dist >= retset[L - 1].distance) continue;
+         Neighbor nn(id, dist, true);
+         int r = InsertIntoPool(retset.data(), L, nn);
+ 
+-        // if(L+1 < retset.size()) ++L;
+         if (r < nk) nk = r;
+       }
+     }
+-    if (nk <= k)
+-      k = nk;
+-    else
+-      ++k;
+-  }
+-  for (size_t i = 0; i < K; i++) {
+-    indices[i] = retset[i].id;
+-  }
++    if (nk <= k) k = nk;
++    else ++k;
++  }
++
++  distance_computation_counter += local_dist_cnt;
++  for (size_t i = 0; i < K; i++) indices[i] = retset[i].id;
++}
++
++ 
++void IndexNSG::SearchWithOptGraph(const float *query, size_t K,
++                                  const Parameters &parameters,
++                                  const std::vector<std::pair<unsigned, float>>& entry_points,
++                                  unsigned *indices) {
++  unsigned L = parameters.Get<unsigned>("L_search");
++  if (L < K) {
++    L = (unsigned)K;
++  }
++
++  unsigned long long local_dist_cnt = 0;
++  DistanceFastL2 *dist_fast = (DistanceFastL2 *)distance_;
++
++  std::vector<Neighbor> retset(L + 1);
++  std::vector<unsigned> init_ids;
++  init_ids.reserve(L);
++
++  boost::dynamic_bitset<> flags{nd_, 0};
++
++   
++  for (const auto& ep_pair : entry_points) {
++    unsigned ep_id = ep_pair.first;
++    if (ep_id >= nd_) continue;
++
++     
++    if (!flags[ep_id] && init_ids.size() < L) {
++      init_ids.push_back(ep_id);
++      flags[ep_id] = true;
++    }
++
++     
++    unsigned *ep_neighbors = (unsigned *)(opt_graph_ + node_size * ep_id + data_len);
++    unsigned MaxM_ep = *ep_neighbors;
++    ep_neighbors++;
++
++    for (unsigned i = 0; i < MaxM_ep && init_ids.size() < L; i++) {
++      unsigned neighbor_id = ep_neighbors[i];
++      if (neighbor_id < nd_ && !flags[neighbor_id]) {
++        init_ids.push_back(neighbor_id);
++        flags[neighbor_id] = true;
++      }
++    }
++  }
++
++   
++  while (init_ids.size() < L) {
++    unsigned id = rand() % nd_;
++    if (flags[id]) continue;
++    flags[id] = true;
++    init_ids.push_back(id);
++  }
++
++   
++  unsigned tmp_l = init_ids.size();
++  for (unsigned i = 0; i < tmp_l; i++) {
++    _mm_prefetch(opt_graph_ + node_size * init_ids[i], _MM_HINT_T0);
++  }
++
++   
++  unsigned actual_L = 0;
++  for (unsigned i = 0; i < tmp_l; i++) {
++    unsigned id = init_ids[i];
++    float *x = (float *)(opt_graph_ + node_size * id);
++    float norm_x = *x;
++    x++;
++    float dist = dist_fast->compare(x, query, norm_x, (unsigned)dimension_);
++    local_dist_cnt++;
++    retset[actual_L] = Neighbor(id, dist, true);
++    actual_L++;
++  }
++
++  std::sort(retset.begin(), retset.begin() + actual_L);
++
++   
++  int k = 0;
++  while (k < (int)actual_L) {
++    int nk = actual_L;
++
++    if (retset[k].flag) {
++      retset[k].flag = false;
++      unsigned n = retset[k].id;
++
++       
++      if (k + 1 < (int)actual_L && retset[k + 1].flag) {
++        unsigned next_id = retset[k + 1].id;
++        _mm_prefetch(opt_graph_ + node_size * next_id, _MM_HINT_T0);
++        _mm_prefetch(opt_graph_ + node_size * next_id + data_len, _MM_HINT_T0);
++      }
++
++       
++      char* neighbor_base = opt_graph_ + node_size * n + data_len;
++      unsigned *neighbors = (unsigned *)neighbor_base;
++      unsigned MaxM = *neighbors;
++      neighbors++;
++
++       
++      constexpr unsigned PREFETCH_DISTANCE = 3;
++
++      for (unsigned m = 0; m < MaxM; ++m) {
++        if (m + PREFETCH_DISTANCE < MaxM) {
++          unsigned p_id = neighbors[m + PREFETCH_DISTANCE];
++          _mm_prefetch(opt_graph_ + node_size * p_id, _MM_HINT_T1);
++        }
++
++        unsigned id = neighbors[m];
++        if (flags[id]) continue;
++        flags[id] = 1;
++
++        float *data = (float *)(opt_graph_ + node_size * id);
++        float norm = *data;
++        data++;
++
++        float dist = dist_fast->compare(query, data, norm, (unsigned)dimension_);
++        local_dist_cnt++;
++
++        if (dist >= retset[actual_L - 1].distance) continue;
++        Neighbor nn(id, dist, true);
++        int r = InsertIntoPool(retset.data(), actual_L, nn);
++
++        if (r < nk) nk = r;
++      }
++    }
++    if (nk <= k) k = nk;
++    else ++k;
++  }
++
++  distance_computation_counter += local_dist_cnt;
++  for (size_t i = 0; i < K; i++) indices[i] = retset[i].id;
+ }
+ 
+ void IndexNSG::OptimizeGraph(float *data) {  // use after build or load
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,11 +1,21 @@
+ set(CMAKE_CXX_STANDARD 11)
+ 
++
++find_library(TCMALLOC_LIB tcmalloc)
++if(TCMALLOC_LIB)
++    message(STATUS "Found TCMalloc: ${TCMALLOC_LIB}")
++    set(TCMALLOC_LINK tcmalloc)
++else()
++    message(STATUS "TCMalloc not found - building without it")
++    set(TCMALLOC_LINK "")
++endif()
++
+ add_executable(test_nsg_index test_nsg_index.cpp)
+-target_link_libraries(test_nsg_index ${PROJECT_NAME} -ltcmalloc)
++target_link_libraries(test_nsg_index ${PROJECT_NAME} ${TCMALLOC_LINK})
+ 
+ add_executable(test_nsg_search test_nsg_search.cpp)
+ target_link_libraries(test_nsg_search ${PROJECT_NAME})
+ 
+ add_executable(test_nsg_optimized_search test_nsg_optimized_search.cpp)
+-target_link_libraries(test_nsg_optimized_search ${PROJECT_NAME} -ltcmalloc)
++target_link_libraries(test_nsg_optimized_search ${PROJECT_NAME} ${TCMALLOC_LINK})
+ 
+--- a/tests/test_nsg_optimized_search.cpp
++++ b/tests/test_nsg_optimized_search.cpp
+@@ -6,6 +6,7 @@
+ #include <efanna2e/util.h>
+ #include <chrono>
+ #include <string>
++#include <iomanip>  
+ 
+ void load_data(char* filename, float*& data, unsigned& num,
+                unsigned& dim) {  // load data with sift10K pattern
+@@ -78,13 +79,32 @@
+   std::vector<std::vector<unsigned> > res(query_num);
+   for (unsigned i = 0; i < query_num; i++) res[i].resize(K);
+ 
++   
++  efanna2e::IndexNSG::distance_computation_counter = 0;
++
+   auto s = std::chrono::high_resolution_clock::now();
+   for (unsigned i = 0; i < query_num; i++) {
+     index.SearchWithOptGraph(query_load + i * dim, K, paras, res[i].data());
+   }
+   auto e = std::chrono::high_resolution_clock::now();
+   std::chrono::duration<double> diff = e - s;
+-  std::cout << "search time: " << diff.count() << "\n";
++  
++   
++  double qps = query_num / diff.count();
++  double avg_search_time = diff.count() / query_num;
++  unsigned long long total_distance_computations = efanna2e::IndexNSG::distance_computation_counter;
++  double avg_distance_computations = (double)total_distance_computations / query_num;
++  
++  std::cout << "{"
++            << "\"total_search_time\":" << std::fixed << std::setprecision(6) << diff.count() << ","
++            << "\"qps\":" << std::fixed << std::setprecision(2) << qps << ","
++            << "\"avg_search_time\":" << std::fixed << std::setprecision(6) << avg_search_time << ","
++            << "\"num_queries\":" << query_num << ","
++            << "\"search_l\":" << L << ","
++            << "\"search_k\":" << K << ","
++            << "\"total_distance_computations\":" << total_distance_computations << ","
++            << "\"avg_distance_computations\":" << std::fixed << std::setprecision(2) << avg_distance_computations
++            << "}" << std::endl;
+ 
+   save_result(argv[6], res);
+ 

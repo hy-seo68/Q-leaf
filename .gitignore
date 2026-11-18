@@ -1,0 +1,17 @@
+/build*/
+/data/
+/indices/
+/results/
+__pycache__/
+*.pyc
+*.a
+*.o
+*.so
+*.so.*
+*.log
+*.fvecs
+*.ivecs
+*.graph
+*.idx
+*.knng
+*.csc
